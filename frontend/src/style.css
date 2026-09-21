@@ -109,6 +109,11 @@ html.webf-engine .miot-app * { transform-origin: 0 0; }
 
 .player-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .toolbar-field { min-width: 0; flex: 1; }
+/* .sl-button-tonal 默认 width:100%（下拉触发器要撑满容器）；player-toolbar 里的按钮要
+   按内容宽紧贴下拉框右侧，不能跟 .toolbar-field 抢空间——旧版把「继续播放」按钮压到
+   与下拉几乎重叠（songloft-org/songloft#478）。与 .model-row > .sl-button、
+   .inline-fields > .sl-button 同一模式。 */
+.player-toolbar > .sl-button { flex: 0 0 auto; width: auto; justify-content: center; padding: 0 18px; }
 .toolbar-divider { width: 1px; height: 32px; background: var(--md-outline-variant); }
 /* 不给 z-index：wrap 不创建层叠上下文，子元素 fixed 面板和遮罩直接参与根层叠上下文，
    z-index 300/200 能可靠地盖住播放条(80)和歌曲列表(songloft-org/songloft#432)。 */
@@ -622,6 +627,9 @@ html.webf-engine .settings-content { height: 100%; overflow-y: auto; }
   .miot-page { padding: calc(66px + var(--sl-safe-top, 0px)) 12px calc(90px + var(--sl-safe-bottom, 0px)); }
   .miot-main-appbar-inner, .settings-appbar-inner, .fullscreen-appbar-inner { padding: 0 12px; }
   .player-toolbar { display: block; }
+  /* 窄屏改为块布局：把「继续播放」按钮独占一行、与安卓端一致（songloft-org/songloft#478）。
+     宽屏版本把它改成 width:auto，这里显式还原为整行宽度。 */
+  .player-toolbar > .sl-button { width: 100%; margin-top: 8px; }
   .toolbar-divider { display: none; }
   .player-bar-shell { height: calc(66px + var(--sl-safe-bottom, 0px)); border-top: none; box-shadow: var(--md-shadow-2); }
   .player-bar-progress { height: 2px; cursor: default; pointer-events: none; }
