@@ -795,6 +795,12 @@ export class IndexingManager {
    * @returns 最多10个匹配结果
    */
   searchPlaylist(query: string): IndexedPlaylist[] {
+    // 空查询视为「列出全部歌单」：无歌单名口令（"放音乐"/"放歌单"）用它挑默认歌单。
+    // 不能交给 fuzzySearchList——它对空 query 直接返回 []，导致冷启动、无活跃歌单时
+    // 口令必报「No playlists available」（songloft-org/songloft-plugin-miot#113）。
+    if (!query || !query.trim()) {
+      return this.playlists.slice(0, MAX_SEARCH_RESULTS);
+    }
     return fuzzySearchList(
       query,
       this.playlists,
