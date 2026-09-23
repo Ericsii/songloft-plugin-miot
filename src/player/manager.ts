@@ -113,6 +113,32 @@ const LOOP_DETECT_MIN_ADVANCE_SEC = 10;
 const LOOP_DETECT_RESET_THRESHOLD_SEC = 3;
 
 /**
+ * duration>0 正常路径的「尾部设备进度校验」参数（songloft-org/songloft#481）。
+ *
+ * 自动切歌是纯 wall-clock 定时器（startCheckTimer），时长写死为元数据
+ * `song.duration + offset`，从不看设备真实进度。当设备实际音频比元数据短（转码差异、
+ * 元数据取整、起播缓冲未计入锚点），设备会先自己播完 → 循环重拉同一 URL 或停滞在结尾，
+ * 而插件仍死等定时器到点，用户听到「一首播完又重播/停滞 1~2 秒才切歌」。靠调负 offset
+ * 只能盲盖固定差值：小了盖不全、大了误切尾部（#481 用户实测 -2 仍有残留）。
+ *
+ * 修法：主定时器保留为「上界兜底」（无任何设备证据时仍按元数据时长切，绝不误切），
+ * 另在最后一段窗口内起一轮轻量探测，一旦读到设备**真实已结束**的证据就提前切歌，
+ * 消除的正是那 1~2s 差值。复用 duration==0 兜底探测里已验证的「循环回零」判据，
+ * 另补「设备已停」和「结尾停滞」两条，覆盖 #481 描述的两种表现（重播 / 停滞）。
+ */
+/** 进入歌曲最后这段窗口（曲内秒）才启动尾部探测；与 EXTERNAL_STOP_TAIL_GUARD_SEC 的盲区对齐，
+ * 恰好接管那段「主定时器主动关掉外部停止探测」的尾部盲区 */
+const TAIL_PROBE_WINDOW_SEC = 15;
+/** 尾部探测轮询间隔（复用兜底探测节奏） */
+const TAIL_PROBE_INTERVAL_MS = DURATION_PROBE_INTERVAL_MS;
+/** 结尾停滞判定：两次探测间曲内位置推进不足该秒数即算「没在推进」（正常播放每轮推进≈探测间隔） */
+const TAIL_STALL_ADVANCE_MIN_SEC = 1;
+/** 连续多少轮「没在推进」才判为结尾停滞：抵御单次 rebuffer/上报抖动，避免没播完就误切 */
+const TAIL_STALL_CONFIRM_COUNT = 2;
+/** 结尾停滞判定的前置条件：曲内位置必须已到「元数据结尾前这段」内，防止歌曲中段的 rebuffer 触发误切 */
+const TAIL_STALL_NEAR_END_SEC = 20;
+
+/**
  * 起播确认探测参数（songloft-org/songloft#466）。
  *
  * ubus `code=0` 只代表「云端把消息代理给了设备」，不代表设备真的拉到了流。
@@ -277,6 +303,10 @@ export class PlaylistManager {
   private resumePollHits: number = 0;   // 连续探测到设备"在播放"的次数
   private durationProbeTimer: any = null; // 定时器ID（duration==0 时兜底切歌探测，见 DURATION_PROBE_* 常量）
   private maxProbePosition: number = 0;   // 循环回零探测：本轮见过的最大设备 position，用于判定是否回零
+  private tailProbeTimer: any = null;     // 定时器ID（duration>0 尾部设备进度校验，见 TAIL_PROBE_* 常量，#481）
+  private tailProbeMaxPosition: number = 0; // 尾部探测：见过的最大设备曲内位置，用于循环回零判定
+  private tailProbeLastPosition: number = -1; // 尾部探测：上一轮设备曲内位置，用于结尾停滞判定，-1=无基线
+  private tailProbeStallCount: number = 0;  // 尾部探测：连续「位置没在推进」的轮数
   private landingVerifyTimer: any = null; // 定时器ID（起播确认探测，见 LANDING_VERIFY_* 常量）
   private landingFailureCount: number = 0; // 连续起播失败次数（#466 熔断），任何一次确认成功即清零
   private unplayableSongIds: Set<number> = new Set(); // 预取失败的歌曲 id，advanceToNext 遇到直接再跳
@@ -1831,6 +1861,13 @@ export class PlaylistManager {
       this.stopPollMisses = 0;
       this.scheduleStopPoll(pollBudgetMs);
     }
+
+    // 尾部设备进度校验（#481）：外部停止探测在结尾前 EXTERNAL_STOP_TAIL_GUARD_SEC 主动关闭，
+    // 那段盲区正是「设备已播完但定时器还没到点」的窗口。接管它——进入最后 TAIL_PROBE_WINDOW_SEC
+    // 才起探，读到设备真实结束证据就提前切歌。仅在 duration>0 的正常定时器路径启用：
+    // duration==0 由 scheduleDurationProbe 全程兜底，无需重复。
+    const tailStartDelayMs = delayMs - TAIL_PROBE_WINDOW_SEC * 1000;
+    this.scheduleTailProbe(tailStartDelayMs);
   }
 
   /**
@@ -1903,6 +1940,111 @@ export class PlaylistManager {
         songloft.log.warn('[PlaylistManager] duration probe error: ' + String(e));
       });
     }, DURATION_PROBE_INTERVAL_MS);
+  }
+
+  /**
+   * 调度 duration>0 正常路径的尾部设备进度校验（#481）。见 TAIL_PROBE_* 常量注释。
+   * 由 startCheckTimer 在注册主定时器时按「进入尾部窗口还剩多久」延迟启动；
+   * 生命周期随 stopCheckTimer 统一清理（暂停/切歌/停止/续播/重锚等都会经它终止）。
+   * @param tailStartDelayMs - 距「进入尾部窗口」的墙钟毫秒，<=0 表示已在窗口内立即起探。
+   */
+  private scheduleTailProbe(tailStartDelayMs: number): void {
+    this.tailProbeMaxPosition = 0;
+    this.tailProbeLastPosition = -1;
+    this.tailProbeStallCount = 0;
+    const delay = Math.max(1, Math.floor(tailStartDelayMs));
+    this.tailProbeTimer = setTimeout(() => {
+      this.tailProbeTimer = null;
+      this.tailProbe().catch(e => {
+        songloft.log.warn('[PlaylistManager] tail probe error: ' + String(e));
+      });
+    }, delay);
+  }
+
+  /**
+   * 单轮尾部探测：读设备真实播放状态，命中任一「设备已结束」证据就提前切歌，
+   * 消除元数据时长比设备实际音频长导致的「重播/停滞 1~2 秒」（#481）。
+   * 三条判据，命中任一即触发提前 onSongFinished：
+   *   1. 循环回零：曲内位置曾推进到阈值以上又落回近 0 → 音箱重拉同一 URL（自然播完）。
+   *   2. 设备已停：位置曾明显推进后 status!=1 → 设备放完自行停止。
+   *   3. 结尾停滞：位置已到元数据结尾附近且连续多轮不推进 → 卡在结尾那 1~2 秒。
+   * 拿不到任何结束证据就继续下一轮；主定时器（checkTimer）仍是最终兜底上界，绝不误切。
+   */
+  private async tailProbe(): Promise<void> {
+    if (this.state !== 'playing') return;
+    const indexAtCheck = this.currentIndex;
+    const song = this.getCurrentSong();
+    if (!song || song.duration <= 0) return;
+
+    try {
+      const st = await this.minaService.getPlayState(this.accountId, this.deviceId);
+      // 探测期间状态已变化（暂停/切歌/停止）：交给那次操作处理，这里不再插手
+      if (this.state !== 'playing' || this.currentIndex !== indexAtCheck) return;
+
+      // 设备上报的 position 是流内偏移，× speed + seek 起点才是曲内绝对秒
+      const devicePos = st.position >= 0
+        ? st.position * this.playbackSpeed + this.streamSeekOffsetSec
+        : -1;
+
+      if (st.status === 1 && devicePos >= 0) {
+        if (devicePos > this.tailProbeMaxPosition) this.tailProbeMaxPosition = devicePos;
+
+        // 判据 1：循环回零（复用兜底探测同源阈值）
+        if (this.tailProbeMaxPosition >= LOOP_DETECT_MIN_ADVANCE_SEC && devicePos < LOOP_DETECT_RESET_THRESHOLD_SEC) {
+          this.triggerTailAdvance(`loop detected (position reset ${this.tailProbeMaxPosition.toFixed(1)}s→${devicePos.toFixed(1)}s)`, indexAtCheck);
+          return;
+        }
+
+        // 判据 3：结尾停滞——已到元数据结尾附近且连续多轮位置不推进
+        const nearEnd = devicePos >= song.duration - TAIL_STALL_NEAR_END_SEC;
+        if (nearEnd && this.tailProbeLastPosition >= 0) {
+          const advanced = devicePos - this.tailProbeLastPosition >= TAIL_STALL_ADVANCE_MIN_SEC;
+          if (advanced) {
+            this.tailProbeStallCount = 0;
+          } else {
+            this.tailProbeStallCount++;
+            if (this.tailProbeStallCount >= TAIL_STALL_CONFIRM_COUNT) {
+              this.triggerTailAdvance(`stalled at tail (position ${devicePos.toFixed(1)}s/${song.duration}s, ${this.tailProbeStallCount} misses)`, indexAtCheck);
+              return;
+            }
+          }
+        } else {
+          // 还没进结尾附近：不累计停滞，只更新基线
+          this.tailProbeStallCount = 0;
+        }
+        this.tailProbeLastPosition = devicePos;
+      } else if (st.status >= 0 && st.status !== 1) {
+        // 判据 2：设备已停。仅当此前位置明显推进过才认（否则是起播早期/网络抖动，交给主定时器与起播确认）
+        if (this.tailProbeMaxPosition >= LOOP_DETECT_MIN_ADVANCE_SEC) {
+          this.triggerTailAdvance(`device stopped (status=${st.status}, maxPos=${this.tailProbeMaxPosition.toFixed(1)}s)`, indexAtCheck);
+          return;
+        }
+      }
+      // status < 0（查询失败/网络抖动）：不动基线、不计停滞，等下一轮
+    } catch (e) {
+      songloft.log.warn('[PlaylistManager] tail probe query failed: ' + String(e));
+    }
+
+    if (this.state !== 'playing' || this.currentIndex !== indexAtCheck) return;
+    this.tailProbeTimer = setTimeout(() => {
+      this.tailProbeTimer = null;
+      this.tailProbe().catch(e => {
+        songloft.log.warn('[PlaylistManager] tail probe error: ' + String(e));
+      });
+    }, TAIL_PROBE_INTERVAL_MS);
+  }
+
+  /**
+   * 尾部探测命中「设备已结束」证据：清掉主定时器后提前触发 onSongFinished。
+   * onSongFinished → advanceToNext → playCurrent 会经 stopCheckTimer 清掉本探测，不会重入。
+   */
+  private triggerTailAdvance(reason: string, indexAtCheck: number): void {
+    if (this.state !== 'playing' || this.currentIndex !== indexAtCheck) return;
+    songloft.log.info(`[PlaylistManager] Tail probe advancing early: ${reason}`);
+    this.stopCheckTimer();
+    this.onSongFinished().catch(e => {
+      songloft.log.error('[PlaylistManager] onSongFinished error: ' + String(e));
+    });
   }
 
   /**
@@ -2000,6 +2142,13 @@ export class PlaylistManager {
       this.durationProbeTimer = null;
     }
     this.maxProbePosition = 0;
+    if (this.tailProbeTimer !== null) {
+      clearTimeout(this.tailProbeTimer);
+      this.tailProbeTimer = null;
+    }
+    this.tailProbeMaxPosition = 0;
+    this.tailProbeLastPosition = -1;
+    this.tailProbeStallCount = 0;
     if (this.landingVerifyTimer !== null) {
       clearTimeout(this.landingVerifyTimer);
       this.landingVerifyTimer = null;
