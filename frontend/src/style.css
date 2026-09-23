@@ -262,7 +262,11 @@ html.webf-engine .sl-select-wrap { width: auto; }
   padding: 4px 10px;
   border-radius: 4px;
   background: var(--md-inverse-surface);
-  color: var(--md-inverse-on-surface);
+  /* 变量名和宿主注入的 `--md-on-inverse-surface` 保持一致（common.js 由 camelCase
+     `onInverseSurface` 转出的就是这个 kebab-case）。写成 `--md-inverse-on-surface`
+     取不到值，color 会回退到继承色，浮层文字与背景重叠成黑框
+     （songloft-org/songloft#469）。同文件的 `.toast` 用的就是正确写法。 */
+  color: var(--md-on-inverse-surface);
   font-size: 12px;
   white-space: nowrap;
   pointer-events: none;
